@@ -1,8 +1,10 @@
 #include <assert.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "pcap/pcap.h"
+#include "pthread/pthread.h"
 
 typedef uint32_t ipv4_addr_t;
 
@@ -69,24 +71,44 @@ typedef struct {
   ipv4_addr_t dst_addr;
 } ipv4_header_t;
 
+/// Thread-shared variable for user input, indicating keep running or not
+bool keep_running = true;
+
+/// Listen for user input in a separate thread.
+void* listen_quit(void* args) {
+  while (keep_running) {
+    char c = getchar();
+    if (c == 'q') {
+      keep_running = false;
+    }
+  }
+  return NULL;
+}
+
 void callback(
   uint8_t* args,
   const struct pcap_pkthdr* header,
   const uint8_t* packet
 ) {
-  for (size_t i = 0; i < 100; i++) {
+  // if user input 'q', stop capturing
+  if (!keep_running) {
+    printf("stopping...\n");
+    pcap_breakloop((pcap_t*)args);
+  }
+
+  for (size_t i = 0; i < 50; i++) {
     printf("=");
   }
   printf("\n");
 
   printf(
-    "timestamp: %s.%06d\n",
+    "timestamp: \033[32m%s.%06d\033[39m\n",
     // ignore newline
     strtok(ctime((const time_t*)&header->ts.tv_sec), "\n"), header->ts.tv_usec
   );
 
-  printf("pktlen:    %d\n", header->len);
-  printf("comment:   %s\n", header->comment);
+  printf("pktlen:    \033[32m%d\033[39m\n", header->len);
+  printf("comment:   \033[32m%s\033[39m\n", header->comment);
 
   for (size_t i = 0; i < 50; i++) {
     printf("-");
@@ -97,14 +119,14 @@ void callback(
 
   printf("Ethernet header\n");
   printf(
-    "  dst mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    "  dst mac:     \033[94m%02x:%02x:%02x:%02x:%02x:%02x\033[39m\n",
     ethernet_header->dst_mac.addr[0], ethernet_header->dst_mac.addr[1],
     ethernet_header->dst_mac.addr[2], ethernet_header->dst_mac.addr[3],
     ethernet_header->dst_mac.addr[4], ethernet_header->dst_mac.addr[5]
   );
 
   printf(
-    "  src mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    "  src mac:     \033[94m%02x:%02x:%02x:%02x:%02x:%02x\033[39m\n",
     ethernet_header->src_mac.addr[0], ethernet_header->src_mac.addr[1],
     ethernet_header->src_mac.addr[2], ethernet_header->src_mac.addr[3],
     ethernet_header->src_mac.addr[4], ethernet_header->src_mac.addr[5]
@@ -112,7 +134,7 @@ void callback(
 
   uint16_t ether_type = ntohs(ethernet_header->ether_type);
 
-  printf("  type/length: 0x%04x\n", ether_type);
+  printf("  type/length: \033[94m0x%04x\033[39m\n", ether_type);
 
   for (size_t i = 0; i < 50; i++) {
     printf("-");
@@ -145,23 +167,25 @@ void callback(
       ipv4_addr_t dst_addr = ntohl(ipv4_header->dst_addr);
 
       printf("IPv4 header\n");
-      printf("  ver:  %d\n", version);
-      printf("  ihl:  %d\n", ihl);
-      printf("  dscp: %d\n", dscp);
-      printf("  ecn:  %d\n", ecn);
-      printf("  total length:   %d\n", total_length);
-      printf("  identification: 0x%04x\n", identification);
-      printf("  fragmentation:  0x%04x\n", fragmentation);
-      printf("  ttl:      %d\n", ttl);
-      printf("  protocol: %d\n", protocol);
-      printf("  checksum: 0x%04x\n", checksum);
+      printf("  ver:            \033[94m%d\033[39m\n", version);
+      printf("  ihl:            \033[94m%d\033[39m\n", ihl);
+      printf("  dscp:           \033[94m%d\033[39m\n", dscp);
+      printf("  ecn:            \033[94m%d\033[39m\n", ecn);
+      printf("  total length:   \033[94m%d\033[39m\n", total_length);
+      printf("  identification: \033[94m0x%04x\033[39m\n", identification);
+      printf("  fragmentation:  \033[94m0x%04x\033[39m\n", fragmentation);
+      printf("  ttl:            \033[94m%d\033[39m\n", ttl);
+      printf("  protocol:       \033[94m%d\033[39m\n", protocol);
+      printf("  checksum:       \033[94m0x%04x\033[39m\n", checksum);
       printf(
-        "  src addr: %d.%d.%d.%d\n", (src_addr >> 24) & 0xFF,
-        (src_addr >> 16) & 0xFF, (src_addr >> 8) & 0xFF, (src_addr >> 0) & 0xFF
+        "  src addr:       \033[94m%d.%d.%d.%d\033[39m\n",
+        (src_addr >> 24) & 0xFF, (src_addr >> 16) & 0xFF,
+        (src_addr >> 8) & 0xFF, (src_addr >> 0) & 0xFF
       );
       printf(
-        "  dst addr: %d.%d.%d.%d\n", (dst_addr >> 24) & 0xFF,
-        (dst_addr >> 16) & 0xFF, (dst_addr >> 8) & 0xFF, (dst_addr >> 0) & 0xFF
+        "  dst addr:       \033[94m%d.%d.%d.%d\033[39m\n",
+        (dst_addr >> 24) & 0xFF, (dst_addr >> 16) & 0xFF,
+        (dst_addr >> 8) & 0xFF, (dst_addr >> 0) & 0xFF
       );
 
       break;
@@ -254,18 +278,18 @@ int main(int argc, char* argv[]) {
   // device list is no longer needed
   pcap_freealldevs(alldevs);
 
-  if (handle == NULL) {
-    fprintf(stderr, "error in pcap_open_live: %s\n", errbuf);
-    return 1;
-  }
-
   int packet_count = 0;
   printf("enter packet count: ");
   scanf("%d", &packet_count);
 
-  // start capturing
-  pcap_loop(handle, packet_count, callback, NULL);
+  if (packet_count <= 0) {
+    // start listening for user inputs
+    pthread_t thread;
+    pthread_create(&thread, NULL, listen_quit, NULL);
+  }
 
+  // start capturing
+  pcap_loop(handle, packet_count, callback, (uint8_t*)handle);
   // close the session
   pcap_close(handle);
 

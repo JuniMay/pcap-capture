@@ -95,6 +95,8 @@ bpf_u_int32 len;	/* length of this packet (off wire) */
 
 之后 `const u_char* bytes` 就是实际的数据包数据的开始位置。
 
+在数据包捕获的循环过程中可以通过 `pcap_breakloop()` 退出，但是在调用之后会在下一轮捕获之后退出，并且需要指定对应的设备句柄。
+
 ## 实现数据包的捕获与分析
 
 在使用 libpcap 完成数据包捕获和分析的过程中，实现了对以太网数据帧中头部信息的读取，并且如果数据包为 IPv4 的数据包则对其中头部的数据进行了初步的提取。
@@ -213,69 +215,97 @@ for (pcap_if_t* d = alldevs; d != NULL; d = d->next) {
 之后通过命令行选择网卡设备并且打开网卡设备，设置数据包捕获时需要用到的属性
 
 ```c
-// choose one device to capture
-size_t device_number;
-printf("enter device number: ");
-scanf("%lu", &device_number);
+int main(int argc, char* argv[]) {
+  /* ... fetch and print device list ... */
 
-if (device_number >= device_count) {
-  fprintf(stderr, "invalid device number\n");
-  return 1;
+  printf("total: %lu devices\n", device_count);
+
+  // choose one device to capture
+  size_t device_number;
+  printf("enter device number: ");
+  scanf("%lu", &device_number);
+
+  if (device_number >= device_count) {
+    fprintf(stderr, "invalid device number\n");
+    return 1;
+  }
+
+  // get device
+  pcap_if_t* device = alldevs;
+  for (size_t i = 0; i < device_number; i++) {
+    device = device->next;
+  }
+
+  printf("selected device: %s\n", device->name);
+
+  pcap_t* handle = pcap_create(device->name, errbuf);
+  if (handle == NULL) {
+    fprintf(stderr, "error in pcap_create: %s\n", errbuf);
+    return 1;
+  }
+  // promiscuous mode, all packets are received regardless of the address
+  pcap_set_promisc(handle, 1);
+  // 65535 bytes, maximum size of a packet to capture
+  // reference: `man pcap`
+  // > `A snapshot length of 65535 should be sufficient, on most if not all
+  // > networks, to capture all the data available from the packet.`
+  pcap_set_snaplen(handle, 65535);
+  // timeout, 1000ms
+  pcap_set_timeout(handle, 1000);
+
+  if (pcap_activate(handle) != 0) {
+    fprintf(stderr, "error in pcap_activate: %s\n", pcap_geterr(handle));
+    return 1;
+  }
+
+  // device list is no longer needed
+  pcap_freealldevs(alldevs);
+	
+  /* ... start capturing the packets ... */
 }
 
-// get device
-pcap_if_t* device = alldevs;
-for (size_t i = 0; i < device_number; i++) {
-  device = device->next;
-}
+```
 
-printf("selected device: %s\n", device->name);
+最后输入所需要捕获的数据包数量，若输入 `-1` 则表示一直捕获。此外，为了保证能够正常退出以及释放资源，在代码实现中开启了一个线程来监听用户输入，当用户输入 `q` 时退出捕获。
 
-pcap_t* handle = pcap_create(device->name, errbuf);
-if (handle == NULL) {
-  fprintf(stderr, "error in pcap_create: %s\n", errbuf);
-  return 1;
-}
-// promiscuous mode, all packets are received regardless of the address
-pcap_set_promisc(handle, 1);
-// 65535 bytes, maximum size of a packet to capture
-// reference: `man pcap`
-// > `A snapshot length of 65535 should be sufficient, on most if not all
-// > networks, to capture all the data available from the packet.`
-pcap_set_snaplen(handle, 65535);
-// timeout, 1000ms
-pcap_set_timeout(handle, 1000);
+```c
+/// Thread-shared variable for user input, indicating keep running or not
+bool keep_running = true;
 
-if (pcap_activate(handle) != 0) {
-  fprintf(stderr, "error in pcap_activate: %s\n", pcap_geterr(handle));
-  return 1;
-}
-
-// device list is no longer needed
-pcap_freealldevs(alldevs);
-
-if (handle == NULL) {
-  fprintf(stderr, "error in pcap_open_live: %s\n", errbuf);
-  return 1;
+/// Listen for user input in a separate thread.
+void* listen_quit(void* args) {
+  while (keep_running) {
+    char c = getchar();
+    if (c == 'q') {
+      keep_running = false;
+    }
+  }
+  return NULL;
 }
 ```
 
-最后输入所需要捕获的数据包数量，若输入 `-1` 则表示一直捕获。
+当 `packet_count` 小于等于零时，开启这一线程，在之后开启捕获数据包的循环，并且最终退出。
 
 ```c
-int packet_count = 0;
-printf("enter packet count: ");
-scanf("%d", &packet_count);
+int main(int argc, char* argv[]) {
 
-// start capturing
-pcap_loop(handle, packet_count, callback, NULL);
-```
+  /* ... prepare the capture process ... */
 
-在最后再关闭设备句柄
+  int packet_count = 0;
+  printf("enter packet count: ");
+  scanf("%d", &packet_count);
 
-```c
-// close the session
-pcap_close(handle);
+  if (packet_count <= 0) {
+    // start listening for user inputs
+    pthread_t thread;
+     pthread_create(&thread, NULL, listen_quit, NULL);
+  }
+
+  // start capturing
+  pcap_loop(handle, packet_count, callback, (uint8_t*)handle);
+  // close the session
+  pcap_close(handle);
+}
 ```
 
 ### 回调函数
@@ -288,19 +318,25 @@ void callback(
   const struct pcap_pkthdr* header,
   const uint8_t* packet
 ) {
-  for (size_t i = 0; i < 100; i++) {
+  // if user input 'q', stop capturing
+  if (!keep_running) {
+    printf("stopping...\n");
+    pcap_breakloop((pcap_t*)args);
+  }
+
+  for (size_t i = 0; i < 50; i++) {
     printf("=");
   }
   printf("\n");
 
   printf(
-    "timestamp: %s.%06d\n",
+    "timestamp: \033[32m%s.%06d\033[39m\n",
     // ignore newline
     strtok(ctime((const time_t*)&header->ts.tv_sec), "\n"), header->ts.tv_usec
   );
 
-  printf("pktlen:    %d\n", header->len);
-  printf("comment:   %s\n", header->comment);
+  printf("pktlen:    \033[32m%d\033[39m\n", header->len);
+  printf("comment:   \033[32m%s\033[39m\n", header->comment);
 
   for (size_t i = 0; i < 50; i++) {
     printf("-");
@@ -311,14 +347,14 @@ void callback(
 
   printf("Ethernet header\n");
   printf(
-    "  dst mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    "  dst mac:     \033[94m%02x:%02x:%02x:%02x:%02x:%02x\033[39m\n",
     ethernet_header->dst_mac.addr[0], ethernet_header->dst_mac.addr[1],
     ethernet_header->dst_mac.addr[2], ethernet_header->dst_mac.addr[3],
     ethernet_header->dst_mac.addr[4], ethernet_header->dst_mac.addr[5]
   );
 
   printf(
-    "  src mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    "  src mac:     \033[94m%02x:%02x:%02x:%02x:%02x:%02x\033[39m\n",
     ethernet_header->src_mac.addr[0], ethernet_header->src_mac.addr[1],
     ethernet_header->src_mac.addr[2], ethernet_header->src_mac.addr[3],
     ethernet_header->src_mac.addr[4], ethernet_header->src_mac.addr[5]
@@ -326,7 +362,7 @@ void callback(
 
   uint16_t ether_type = ntohs(ethernet_header->ether_type);
 
-  printf("  type/length: 0x%04x\n", ether_type);
+  printf("  type/length: \033[94m0x%04x\033[39m\n", ether_type);
 
   for (size_t i = 0; i < 50; i++) {
     printf("-");
@@ -339,9 +375,7 @@ void callback(
   switch (ether_type) {
     case ETHER_TYPE_IPV4: {
       ipv4_header_t* ipv4_header = (ipv4_header_t*)payload;
-
-      /* ... interpret and print ... */
-      
+      /* ... interpret and print ipv4 information ... */
       break;
     }
     case ETHER_TYPE_IPV6: {
@@ -360,12 +394,15 @@ void callback(
 }
 ```
 
+此外在输出数据包的值时进行了简单的高亮，方便查看。
+
 ### 运行结果
 
-获取网卡设备列表：
+查看设备列表
 
-![image-20231015204205614](./report.assets/image-20231015204205614.png)
+![image-20231016151903969](./report.assets/image-20231016151903969.png)
 
-数据包捕获结果示例如下
+捕获数据包过程以及解析出的信息
 
-![image-20231015204222870](./report.assets/image-20231015204222870.png)
+![image-20231016151939911](./report.assets/image-20231016151939911.png)
+
